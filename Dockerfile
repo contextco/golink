@@ -15,7 +15,7 @@ RUN \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -v ./cmd/golink
 
 
-FROM cgr.dev/chainguard/static:latest
+FROM cgr.dev/chainguard/wolfi-base
 
 RUN apk update && apk add openssh
 
