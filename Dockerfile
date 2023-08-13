@@ -17,6 +17,8 @@ RUN \
 
 FROM cgr.dev/chainguard/static:latest
 
+RUN apk update && apk add openssh
+
 ENV HOME /home/nonroot
 
 COPY --from=build /work/golink /golink
