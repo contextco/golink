@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -35,7 +34,9 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
+	"tailscale.com/util/dnsname"
 )
 
 const defaultHostname = "go"
@@ -88,7 +89,7 @@ func Run() error {
 
 	if *sqlitefile == "" {
 		if devMode() {
-			tmpdir, err := ioutil.TempDir("", "golink_dev_*")
+			tmpdir, err := os.MkdirTemp("", "golink_dev_*")
 			if err != nil {
 				return err
 			}
@@ -139,15 +140,6 @@ func Run() error {
 	// flush stats periodically
 	go flushStatsLoop()
 
-	http.HandleFunc("/", serveGo)
-	http.HandleFunc("/.detail/", serveDetail)
-	http.HandleFunc("/.export", serveExport)
-	http.HandleFunc("/.help", serveHelp)
-	http.HandleFunc("/.opensearch", serveOpenSearch)
-	http.HandleFunc("/.all", serveAll)
-	http.HandleFunc("/.delete/", serveDelete)
-	http.Handle("/.static/", http.StripPrefix("/.", http.FileServer(http.FS(embeddedFS))))
-
 	if *dev != "" {
 		// override default hostname for dev mode
 		if *hostname == defaultHostname {
@@ -160,13 +152,14 @@ func Run() error {
 		}
 
 		log.Printf("Running in dev mode on %s ...", *dev)
-		log.Fatal(http.ListenAndServe(*dev, nil))
+		log.Fatal(http.ListenAndServe(*dev, serveHandler()))
 	}
 
 	if *hostname == "" {
 		return errors.New("--hostname, if specified, cannot be empty")
 	}
 
+	// create tsNet server and wait for it to be ready & connected.
 	srv := &tsnet.Server{
 		ControlURL: *controlURL,
 		Hostname:   *hostname,
@@ -178,17 +171,55 @@ func Run() error {
 	if err := srv.Start(); err != nil {
 		return err
 	}
-	localClient, _ = srv.LocalClient()
 
-	l80, err := srv.Listen("tcp", ":80")
+	localClient, _ = srv.LocalClient()
+out:
+	for {
+		upCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		status, err := srv.Up(upCtx)
+		if err == nil && status != nil {
+			break out
+		}
+	}
+
+	statusCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err := localClient.Status(statusCtx)
 	if err != nil {
 		return err
 	}
+	enableTLS := status.Self.HasCap(tailcfg.CapabilityHTTPS) && len(srv.CertDomains()) > 0
+	fqdn := strings.TrimSuffix(status.Self.DNSName, ".")
 
-	log.Printf("Serving http://%s/ ...", *hostname)
-	if err := http.Serve(l80, nil); err != nil {
+	httpHandler := serveHandler()
+	if enableTLS {
+		httpsHandler := HSTS(httpHandler)
+		httpHandler = redirectHandler(fqdn)
+
+		httpsListener, err := srv.ListenTLS("tcp", ":443")
+		if err != nil {
+			return err
+		}
+		log.Println("Listening on :443")
+		go func() {
+			log.Printf("Serving https://%s/ ...", fqdn)
+			if err := http.Serve(httpsListener, httpsHandler); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
+
+	httpListener, err := srv.Listen("tcp", ":80")
+	log.Println("Listening on :80")
+	if err != nil {
 		return err
 	}
+	log.Printf("Serving http://%s/ ...", *hostname)
+	if err := http.Serve(httpListener, httpHandler); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -295,6 +326,57 @@ func deleteLinkStats(link *Link) {
 	db.DeleteStats(link.Short)
 }
 
+// redirectHandler returns the http.Handler for serving all plaintext HTTP
+// requests. It redirects all requests to the HTTPs version of the same URL.
+func redirectHandler(hostname string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, (&url.URL{Scheme: "https", Host: hostname, Path: r.URL.Path}).String(), http.StatusFound)
+	})
+}
+
+// HSTS wraps the provided handler and sets Strict-Transport-Security header on
+// responses. It inspects the Host header to ensure we do not specify HSTS
+// response on non fully qualified domain name origins.
+func HSTS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, found := r.Header["Host"]
+		if found {
+			host := host[0]
+			fqdn, err := dnsname.ToFQDN(host)
+			if err == nil {
+				segCount := fqdn.NumLabels()
+				if segCount > 1 {
+					w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+				}
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// serverHandler returns the main http.Handler for serving all requests.
+func serveHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.detail/", serveDetail)
+	mux.HandleFunc("/.export", serveExport)
+	mux.HandleFunc("/.help", serveHelp)
+	mux.HandleFunc("/.opensearch", serveOpenSearch)
+	mux.HandleFunc("/.all", serveAll)
+	mux.HandleFunc("/.delete/", serveDelete)
+	mux.Handle("/.static/", http.StripPrefix("/.", http.FileServer(http.FS(embeddedFS))))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// all internal URLs begin with a leading "."; any other URL is treated as a go link.
+		// Serve go links directly without passing through the ServeMux,
+		// which sometimes modifies the request URL path, which we don't want.
+		if !strings.HasPrefix(r.URL.Path, "/.") {
+			serveGo(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
 func serveHome(w http.ResponseWriter, short string) {
 	var clicks []visitData
 
@@ -396,8 +478,8 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 	stats.dirty[link.Short]++
 	stats.mu.Unlock()
 
-	login, _ := currentUser(r)
-	env := expandEnv{Now: time.Now().UTC(), Path: remainder, user: login, query: r.URL.Query()}
+	cu, _ := currentUser(r)
+	env := expandEnv{Now: time.Now().UTC(), Path: remainder, user: cu.login, query: r.URL.Query()}
 	target, err := expandLink(link.Long, env)
 	if err != nil {
 		log.Printf("expanding %q: %v", link.Long, err)
@@ -408,7 +490,11 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, target.String(), http.StatusFound)
+
+	// http.Redirect always cleans the redirect URL, which we don't always want.
+	// Instead, manually set status and Location header.
+	w.Header().Set("Location", target.String())
+	w.WriteHeader(http.StatusFound)
 }
 
 // acceptHTML returns whether the request can accept a text/html response.
@@ -446,21 +532,24 @@ func serveDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	login, err := currentUser(r)
+	cu, err := currentUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	canEdit := canEditLink(r.Context(), link, cu)
 	ownerExists, err := userExists(r.Context(), link.Owner)
 	if err != nil {
 		log.Printf("looking up tailnet user %q: %v", link.Owner, err)
 	}
 
-	data := detailData{Link: link}
-	if link.Owner == login || !ownerExists {
-		data.Editable = true
-		data.Link.Owner = login
-		data.XSRF = xsrftoken.Generate(xsrfKey, login, short)
+	data := detailData{
+		Link:     link,
+		Editable: canEdit,
+		XSRF:     xsrftoken.Generate(xsrfKey, cu.login, short),
+	}
+	if canEdit && !ownerExists {
+		data.Link.Owner = cu.login
 	}
 
 	detailTmpl.Execute(w, data)
@@ -541,24 +630,42 @@ func expandLink(long string, env expandEnv) (*url.URL, error) {
 
 func devMode() bool { return *dev != "" }
 
+const peerCapName = "tailscale.com/cap/golink"
+
+type capabilities struct {
+	Admin bool `json:"admin"`
+}
+
+type user struct {
+	login   string
+	isAdmin bool
+}
+
 // currentUser returns the Tailscale user associated with the request.
 // In most cases, this will be the user that owns the device that made the request.
 // For tagged devices, the value "tagged-devices" is returned.
 // If the user can't be determined (such as requests coming through a subnet router),
 // an error is returned unless the -allow-unknown-users flag is set.
-var currentUser = func(r *http.Request) (string, error) {
+var currentUser = func(r *http.Request) (user, error) {
 	if devMode() {
-		return "foo@example.com", nil
+		return user{login: "foo@example.com"}, nil
 	}
 	whois, err := localClient.WhoIs(r.Context(), r.RemoteAddr)
 	if err != nil {
 		if *allowUnknownUsers {
 			// Don't report the error if we are allowing unknown users.
-			return "", nil
+			return user{}, nil
 		}
-		return "", err
+		return user{}, err
 	}
-	return whois.UserProfile.LoginName, nil
+	login := whois.UserProfile.LoginName
+	caps, _ := tailcfg.UnmarshalCapJSON[capabilities](whois.CapMap, peerCapName)
+	for _, cap := range caps {
+		if cap.Admin {
+			return user{login: login, isAdmin: true}, nil
+		}
+	}
+	return user{login: login}, nil
 }
 
 // userExists returns whether a user exists with the specified login in the current tailnet.
@@ -597,7 +704,7 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	login, err := currentUser(r)
+	cu, err := currentUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -609,12 +716,12 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := checkLinkOwnership(r.Context(), link, login); err != nil {
-		http.Error(w, fmt.Sprintf("cannot delete link: %v", err), http.StatusForbidden)
+	if !canEditLink(r.Context(), link, cu) {
+		http.Error(w, fmt.Sprintf("cannot delete link owned by %q", link.Owner), http.StatusForbidden)
 		return
 	}
 
-	if !xsrftoken.Valid(r.PostFormValue("xsrf"), xsrfKey, login, short) {
+	if !xsrftoken.Valid(r.PostFormValue("xsrf"), xsrfKey, cu.login, short) {
 		http.Error(w, "invalid XSRF token", http.StatusBadRequest)
 		return
 	}
@@ -646,7 +753,7 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	login, err := currentUser(r)
+	cu, err := currentUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -657,8 +764,8 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	if err := checkLinkOwnership(r.Context(), link, login); err != nil {
-		http.Error(w, fmt.Sprintf("cannot update link: %v", err), http.StatusForbidden)
+	if !canEditLink(r.Context(), link, cu) {
+		http.Error(w, fmt.Sprintf("cannot update link owned by %q", link.Owner), http.StatusForbidden)
 		return
 	}
 
@@ -674,7 +781,7 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		owner = login
+		owner = cu.login
 	}
 
 	now := time.Now().UTC()
@@ -701,21 +808,25 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func checkLinkOwnership(ctx context.Context, link *Link, login string) error {
+// canEditLink returns whether the specified user has permission to edit link.
+// Admin users can edit all links.
+// Non-admin users can only edit their own links or links without an active owner.
+func canEditLink(ctx context.Context, link *Link, u user) bool {
 	if link == nil || link.Owner == "" {
-		return nil
+		// new or unowned link
+		return true
 	}
 
-	linkOwnerExists, err := userExists(ctx, link.Owner)
+	if u.isAdmin || link.Owner == u.login {
+		return true
+	}
+
+	owned, err := userExists(ctx, link.Owner)
 	if err != nil {
 		log.Printf("looking up tailnet user %q: %v", link.Owner, err)
 	}
-	// Don't allow deleting or updating links if the owner account still exists
-	// or if we're unsure because an error occurred.
-	if (linkOwnerExists && link.Owner != login) || err != nil {
-		return fmt.Errorf("link owned by user %q", link.Owner)
-	}
-	return nil
+	// Allow editing if the link is currently unowned
+	return err == nil && !owned
 }
 
 // serveExport prints a snapshot of the link database. Links are JSON encoded
